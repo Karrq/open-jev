@@ -7,3 +7,6 @@ runs/
 *.npz
 # ViZDoom writes this config into the cwd on first launch
 _vizdoom.ini
+
+# mkdocs build output
+site/

@@ -1,4 +1,4 @@
-"""Zero-shot option scoring with Gemma 3 via mlx-lm (Route B in docs/one-pass-option-scoring.md).
+"""Zero-shot option scoring with Gemma 3 via mlx-lm (Route B in docs/design/one-pass-option-scoring.md).
 
 The context is prefilled once. Its KV cache is then expanded across the batch
 dimension so every option is scored in one padded forward pass that shares the

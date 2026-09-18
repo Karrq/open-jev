@@ -1,8 +1,8 @@
 # openjev
 
 One-pass option scoring with a local Gemma 3 4B on Apple silicon via MLX.
-Design notes: [docs/one-pass-option-scoring.md](docs/one-pass-option-scoring.md);
-per-task training: [docs/per-task-finetuning-with-gemma.md](docs/per-task-finetuning-with-gemma.md).
+Design notes: [docs/design/one-pass-option-scoring.md](docs/design/one-pass-option-scoring.md);
+per-task training: [docs/design/per-task-finetuning-with-gemma.md](docs/design/per-task-finetuning-with-gemma.md).
 
 Given a context and a list of pre-written options, the model prefills the
 context once, expands that KV cache across the option batch, and scores every

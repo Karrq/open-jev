@@ -6,7 +6,7 @@ replicate the `jevlike` scorer with a regular Gemma 4B, with or without
 training.
 
 Written 2026-09-16 from the design of
-[`vinnylarouge/jevlike`](../../vinnylarouge/jevlike).
+the `vinnylarouge/jevlike` reference implementation.
 
 ---
 

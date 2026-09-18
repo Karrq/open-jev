@@ -1,0 +1,65 @@
+site_name: openjev
+site_description: One-pass option scoring with a local Gemma 3 4B on Apple silicon via MLX.
+site_url: https://daseinlabs.ai/open-jev/
+repo_url: https://github.com/daseinlabs/open-jev
+repo_name: daseinlabs/open-jev
+edit_uri: edit/main/docs/
+docs_dir: docs
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - toc:
+      permalink: true
+  - attr_list
+  - md_in_html
+  - tables
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [.]
+          options:
+            docstring_style: google
+            show_source: false
+            members_order: source
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Guides:
+      - CLI reference: cli.md
+      - Training a head: training.md
+      - Doom demo: doom-demo.md
+  - Design notes:
+      - One-pass option scoring: design/one-pass-option-scoring.md
+      - Per-task fine-tuning with Gemma: design/per-task-finetuning-with-gemma.md
+  - API reference: api.md
