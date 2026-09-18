@@ -38,11 +38,10 @@ Or drive `play.py` directly:
 ```
 
 !!! note "`make doom` variables"
-    The `doom` target passes `--scenario $(SCENARIO)` and `--api $(API)`
-    through to `play.py`, so set them on the command line if you want anything
-    other than the script's own defaults, e.g.
-    `make doom SCENARIO=deadly_corridor API=score`. `API_KEY` defaults to
-    `local`.
+    The `doom` target defaults to `SCENARIO=defend_the_center` and `API=score`
+    and passes them through to `play.py`. Override them on the command line,
+    e.g. `make doom SCENARIO=deadly_corridor API=systemone`. `API_KEY`
+    defaults to `local`.
 
 ## Keys while it runs
 
