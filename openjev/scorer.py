@@ -89,11 +89,11 @@ class OptionScorer:
         else:
             if device not in ("auto", "mps"):
                 raise ValueError("MLX uses Metal; use --backend torch for --device selection")
-            global mx, KVCache
+            global mx, KVCache, RotatingKVCache, make_prompt_cache
             try:
                 import mlx.core as mx
                 from mlx_lm import load
-                from mlx_lm.models.cache import KVCache
+                from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
             except ImportError as exc:
                 raise RuntimeError("MLX requires Apple silicon; use --backend torch") from exc
             self.model, self.tok = load(model_path, adapter_path=adapter_path)
@@ -132,15 +132,48 @@ class OptionScorer:
 
     # --------------------------------------------------------------- prefill
     def _prefill(self, ids: list[int]) -> tuple[list[KVCache], mx.array]:
+        """Prefill with the model's own cache layout.
+
+        Gemma 3 interleaves 29 sliding-window layers with 5 global ones. Giving
+        every layer a full KVCache both wastes memory and lets local layers
+        attend past their window, which disagrees with a single full-sequence
+        forward pass once the context exceeds the window.
+        """
         if not ids:
             raise ValueError("context must contain tokens (or the tokenizer must define BOS)")
         if self._engine is not None:
             return self._engine.prefill(ids)
-        cache = [KVCache() for _ in self.model.layers]
+        cache = make_prompt_cache(self.model)
         logits = self.model(mx.array(ids)[None], cache=cache)
         last = logits[0, -1]
         mx.eval(last, *[c.keys for c in cache], *[c.values for c in cache])
+        self._compact(cache)
         return cache, last
+
+    @staticmethod
+    def _compact(cache: Iterable) -> None:
+        """Drop entries a sliding-window layer can never attend to again.
+
+        A bulk prefill stores every token, because RotatingKVCache only trims on
+        its next update. Trimming to the window now makes the retained prefix
+        several times smaller without changing any later result: the next update
+        would have trimmed to exactly this same tail anyway.
+        """
+        for c in cache:
+            if not isinstance(c, RotatingKVCache) or c.keys is None:
+                continue
+            if c.keys.shape[2] <= c.max_size:
+                continue
+            keys, values = c._temporal_order(c.keys), c._temporal_order(c.values)
+            tail = c.max_size - c.keep
+            if c.keep:
+                keys = mx.concatenate([keys[..., : c.keep, :], keys[..., -tail:, :]], axis=2)
+                values = mx.concatenate([values[..., : c.keep, :], values[..., -tail:, :]], axis=2)
+            else:
+                keys, values = keys[..., -tail:, :], values[..., -tail:, :]
+            c.keys, c.values = keys, values
+            c._idx = keys.shape[2]
+            mx.eval(c.keys, c.values)
 
     @staticmethod
     def _clone(cache: list[KVCache]) -> list[KVCache]:
@@ -153,18 +186,29 @@ class OptionScorer:
         """
         out = []
         for c in cache:
-            e = KVCache()
-            e.keys = c.keys[..., : c.offset, :]
-            e.values = c.values[..., : c.offset, :]
+            if isinstance(c, RotatingKVCache):
+                e = RotatingKVCache(max_size=c.max_size, keep=c.keep)
+                e._idx = c._idx
+                # The buffer is in rotated order, so keep it whole.
+                used = c.keys.shape[2]
+            else:
+                e = KVCache()
+                used = c.offset
             e.offset = c.offset
+            e.keys = c.keys[..., :used, :]
+            e.values = c.values[..., :used, :]
             out.append(e)
         return out
 
     @staticmethod
-    def _expand(cache: list[KVCache], n: int) -> list[KVCache]:
+    def _expand(cache: list, n: int) -> list:
         out = []
         for c in cache:
-            e = KVCache()
+            if isinstance(c, RotatingKVCache):
+                e = RotatingKVCache(max_size=c.max_size, keep=c.keep)
+                e._idx = c._idx
+            else:
+                e = KVCache()
             e.offset = c.offset
             e.keys = mx.repeat(c.keys, n, axis=0)
             e.values = mx.repeat(c.values, n, axis=0)
