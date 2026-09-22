@@ -15,7 +15,13 @@ FEATS  ?= runs/feats
 HEAD   ?= runs/head.safetensors
 SEP    ?= \nChoice: 
 
-.PHONY: help setup venv model serve health request doom systemone score check bench eval features train eval-head clean
+# Gemma 4 26B A4B: 3.8B active parameters, so prefill stays near a 4B dense model
+# while judgement-style answers track the dense 31B. Needs no code change; the
+# scorer builds whatever cache layout the model declares.
+G4_MODEL ?= models/gemma-4-26b-a4b-qat-4bit
+G4_REPO  ?= lmstudio-community/gemma-4-26B-A4B-it-QAT-MLX-4bit
+
+.PHONY: help setup setup-gemma4 venv model serve health request doom systemone score check bench eval features train eval-head clean
 
 help:
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
@@ -27,6 +33,10 @@ venv: ## uv sync with the torch extra (jevlike comparison / HF cross-checks)
 
 model: ## download $(HF_REPO) into $(MODEL) if missing
 	@test -f $(MODEL)/config.json || hf download $(HF_REPO) --local-dir $(MODEL)
+
+setup-gemma4: venv ## create the venv and download Gemma 4 26B A4B instead
+	@test -f $(G4_MODEL)/config.json || hf download $(G4_REPO) --local-dir $(G4_MODEL)
+	@echo "run with: MODEL=$(G4_MODEL) make serve"
 
 serve: ## run the HTTP server (loads the model once; POST /score, POST /v1/systemone, GET /health)
 	$(BIN)/openjev serve --host $(HOST) --port $(PORT) --model $(MODEL)
