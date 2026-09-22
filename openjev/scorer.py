@@ -19,6 +19,16 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 DEFAULT_MODEL = "models/gemma-3-4b-it"
 NORMS = ("mean", "sum", "pmi")
 
+# mlx_lm.generate's own prefill loop uses this same default (see
+# generate_step's prefill_step_size) to keep any single forward pass from
+# spanning the whole prompt. It matters more here than it does upstream:
+# Gemma 4's global-attention layers use head_dim=512, a shape MLX's fused
+# attention kernel does not support, so it falls back to materializing the
+# full (queries x keys) score matrix. At that head_dim, one shot on a
+# ~30k-token prompt requests a single allocation past this machine's Metal
+# buffer ceiling; chunking bounds the query side of that matrix instead.
+DEFAULT_PREFILL_STEP_SIZE = 2048
+
 
 @dataclass(frozen=True)
 class PrefixCache:
@@ -72,11 +82,13 @@ class OptionScorer:
         batch_size: int = 8,
         chat: bool = False,
         sep: str = "",
+        prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
     ) -> None:
         self.model, self.tok = load(model_path)
         self.batch_size = max(1, batch_size)
         self.chat = chat
         self.sep = sep
+        self.prefill_step_size = max(1, prefill_step_size)
         self.pad_id = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
         self.bos_id = self.tok.bos_token_id
         self.last_timing: dict[str, float] = {}
@@ -108,18 +120,35 @@ class OptionScorer:
 
     # --------------------------------------------------------------- prefill
     def _prefill(self, ids: list[int]) -> tuple[list[KVCache], mx.array]:
-        """Prefill with the model's own cache layout.
+        """Prefill with the model's own cache layout, in bounded-size steps.
 
         Gemma 3 interleaves 29 sliding-window layers with 5 global ones. Giving
         every layer a full KVCache both wastes memory and lets local layers
         attend past their window, which disagrees with a single full-sequence
         forward pass once the context exceeds the window.
+
+        Stepping through ``ids`` in chunks rather than one forward pass over
+        the whole prompt also keeps every attention call's query length
+        bounded, which is required at long context (see
+        ``DEFAULT_PREFILL_STEP_SIZE``) and is a side effect of chunking, not
+        its purpose.
+
+        Compacting after every chunk, not just once at the end, matters at
+        long context: ``mx.concatenate`` is not in-place, so each update
+        allocates a fresh old-plus-new buffer for every layer. Left untrimmed
+        across the whole loop, a rotating layer's buffer grows with total
+        tokens seen so far rather than its window, and each chunk briefly
+        holds both the old and new copies live -- close to double the final
+        size by the last chunk of a long prompt.
         """
         cache = make_prompt_cache(self.model)
-        logits = self.model(mx.array(ids)[None], cache=cache)
-        last = logits[0, -1]
-        mx.eval(last, *[c.keys for c in cache], *[c.values for c in cache])
-        self._compact(cache)
+        last = None
+        for start in range(0, len(ids), self.prefill_step_size):
+            chunk = ids[start : start + self.prefill_step_size]
+            logits = self.model(mx.array(chunk)[None], cache=cache)
+            last = logits[0, -1]
+            mx.eval(last, *[c.keys for c in cache], *[c.values for c in cache])
+            self._compact(cache)
         return cache, last
 
     @staticmethod
