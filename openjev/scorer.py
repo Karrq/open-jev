@@ -21,6 +21,19 @@ NORMS = ("mean", "sum", "pmi")
 
 
 @dataclass(frozen=True)
+class PrefixCache:
+    """A prefilled KV cache for a token prefix shared by several prompts.
+
+    ``ids`` is deliberately one token shorter than the prefix text tokenises to:
+    the final token can merge with whatever follows, so dropping it guarantees
+    ``ids`` is a true token prefix of every full prompt built on that text.
+    """
+
+    ids: list[int]
+    cache: list[KVCache]
+
+
+@dataclass(frozen=True)
 class OptionScore:
     option: str
     n_tokens: int
@@ -102,6 +115,24 @@ class OptionScorer:
         return cache, last
 
     @staticmethod
+    def _clone(cache: list[KVCache]) -> list[KVCache]:
+        """Independent caches over the same prefix.
+
+        ``KVCache.update_and_fetch`` writes into spare buffer capacity in place,
+        so sharing the arrays would let one scoring call corrupt the retained
+        prefix. Slicing to ``offset`` both copies and removes the spare capacity,
+        which forces the next write to reallocate instead.
+        """
+        out = []
+        for c in cache:
+            e = KVCache()
+            e.keys = c.keys[..., : c.offset, :]
+            e.values = c.values[..., : c.offset, :]
+            e.offset = c.offset
+            out.append(e)
+        return out
+
+    @staticmethod
     def _expand(cache: list[KVCache], n: int) -> list[KVCache]:
         out = []
         for c in cache:
@@ -167,6 +198,16 @@ class OptionScorer:
             "option_tokens": sum(len(o) for o in opts),
         }
 
+        return self._finalize(options, opts, sums, uncond, norm)
+
+    @staticmethod
+    def _finalize(
+        options: Sequence[str],
+        opts: list[list[int]],
+        sums: list[float],
+        uncond: list[float] | None,
+        norm: str,
+    ) -> list[OptionScore]:
         means = [s / len(o) for s, o in zip(sums, opts)]
         if norm == "sum":
             scores = sums
@@ -189,6 +230,65 @@ class OptionScorer:
                 zip(options, opts, sums, means, scores, probs)
             )
         ]
+
+    # ------------------------------------------------------- shared prefixes
+    def prefill_prefix(self, text: str) -> PrefixCache | None:
+        """Prefill a context prefix once so many prompts can reuse it.
+
+        Returns None when the text is too short to be worth sharing.
+        """
+        ids = self.context_ids(text, chat=False, sep="")[:-1]
+        if len(ids) < 2:
+            return None
+        t0 = time.perf_counter()
+        cache, _ = self._prefill(ids)
+        self.last_timing = {"prefix_prefill_s": time.perf_counter() - t0, "prefix_tokens": len(ids)}
+        return PrefixCache(ids=ids, cache=cache)
+
+    def score_with_prefix(
+        self,
+        prefix: PrefixCache,
+        context: str,
+        options: Sequence[str],
+        norm: str = "mean",
+    ) -> list[OptionScore]:
+        """Like ``score``, but only the tokens past ``prefix`` are encoded.
+
+        ``context`` is still the full prompt; it must begin with the text the
+        prefix was built from.
+        """
+        if norm not in NORMS:
+            raise ValueError(f"norm must be one of {NORMS}")
+        if norm == "pmi":
+            raise ValueError("pmi normalisation needs an unconditional pass and cannot reuse a prefix")
+        if len(options) < 2:
+            raise ValueError("need at least two options")
+
+        t0 = time.perf_counter()
+        opts = [self.option_ids(o) for o in options]
+        ctx_ids = self.context_ids(context, chat=False, sep="")
+        n = len(prefix.ids)
+        if len(ctx_ids) <= n or ctx_ids[:n] != prefix.ids:
+            raise ValueError("context does not start with the prefilled prefix")
+
+        suffix = ctx_ids[n:]
+        cache = self._clone(prefix.cache)
+        last = self.model(mx.array(suffix)[None], cache=cache)[0, -1]
+        mx.eval(last)
+        t1 = time.perf_counter()
+        sums = self._score_with_prefix(cache, last, opts)
+        t2 = time.perf_counter()
+
+        self.last_timing = {
+            "prefill_s": t1 - t0,
+            "options_s": t2 - t1,
+            "uncond_s": 0.0,
+            "total_s": t2 - t0,
+            "context_tokens": len(ctx_ids),
+            "suffix_tokens": len(suffix),
+            "option_tokens": sum(len(o) for o in opts),
+        }
+        return self._finalize(options, opts, sums, None, norm)
 
     def score_naive(self, context: str, options: Sequence[str]) -> list[float]:
         """Reference: re-encode context + option from scratch per option, no cache.

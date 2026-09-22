@@ -8,6 +8,12 @@ Every question is rendered into a plain-text prompt ending in "Answer:\\n" and t
 labels are scored as continuations with one prefix-shared batched forward pass per question.
 Nothing is generated. Confidence is 1 - normalised entropy of the probability distribution,
 an approximation of TypeSafe's "how spread out is the distribution" definition.
+
+Every prompt opens with the same rendered State block, so it is prefilled once per request
+and each question only encodes its own instructions and labels. This matches TypeSafe's
+documented behaviour, where the state is ingested once and every question is evaluated
+against it. Without it a request with many questions re-encodes the whole state per
+question, which dominates cost as soon as the state is large.
 """
 from __future__ import annotations
 
@@ -17,7 +23,7 @@ from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field, model_validator
 
-from .scorer import OptionScorer
+from .scorer import OptionScorer, PrefixCache
 
 Entry = Union[str, dict, list, None]
 MAX_CHOICE_OPTIONS = 255
@@ -103,6 +109,11 @@ def _block(title: str, e: Entry) -> str:
     return f"{title}:\n{body}\n\n" if body else ""
 
 
+def state_prefix(state: Entry) -> str:
+    """The leading text every question prompt for this state shares."""
+    return _block("State", state)
+
+
 def render_choice(state: Entry, q: ChoiceQuestion) -> tuple[str, list[str]]:
     lines = []
     for name, desc in q.criteria.items():
@@ -159,6 +170,10 @@ def confidence(probs: list[float]) -> float:
 def system_one(scorer: OptionScorer, req: SystemOneRequest, model_name: str, norm: str = "sum") -> SystemOneResponse:
     answers: dict[str, Any] = {}
     in_tok = out_tok = 0
+    # pmi needs an unconditional pass per question and cannot reuse a prefix.
+    prefix: PrefixCache | None = None
+    if norm != "pmi" and len(req.questions) > 1:
+        prefix = scorer.prefill_prefix(state_prefix(req.state))
     for qid, q in req.questions.items():
         if isinstance(q, ChoiceQuestion):
             prompt, labels = render_choice(req.state, q)
@@ -166,7 +181,10 @@ def system_one(scorer: OptionScorer, req: SystemOneRequest, model_name: str, nor
             prompt, labels = render_score(req.state, q)
         else:
             prompt, labels = render_noul(req.state, q)
-        res = scorer.score(prompt, labels, norm=norm, chat=False, sep="")
+        if prefix is None:
+            res = scorer.score(prompt, labels, norm=norm, chat=False, sep="")
+        else:
+            res = scorer.score_with_prefix(prefix, prompt, labels, norm=norm)
         probs = [r.probability for r in res]
         in_tok += int(scorer.last_timing["context_tokens"])
         out_tok += int(scorer.last_timing["option_tokens"])

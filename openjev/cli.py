@@ -154,9 +154,40 @@ def cmd_check(args: argparse.Namespace) -> None:
               f"max_abs_diff={max(diffs):.4f} max_rel_diff={rel:.4%}")
         for o, a, b in zip(opts, fast, slow):
             print(f"    cached={a:9.3f} naive={b:9.3f}  {o[:40]!r}")
+    worst = max(worst, _check_shared_prefix(scorer, args.tol))
     ok = worst < args.tol
     print("OK" if ok else f"MISMATCH (worst abs diff {worst:.4f} > tol {args.tol})")
     sys.exit(0 if ok else 1)
+
+
+def _check_shared_prefix(scorer, tol: float) -> float:
+    """Verify a request's shared State prefill gives the same scores as encoding each prompt whole."""
+    from .systemone import NoulQuestion, ScoreQuestion, render_noul, render_score, state_prefix
+
+    state = (
+        "Customer: my payouts have failed for three days and support has not replied. "
+        "I need this escalated before the weekend or I cannot make payroll."
+    )
+    questions = [
+        render_noul(state, NoulQuestion(type="noul", instructions="Does this convey urgency?")),
+        render_noul(state, NoulQuestion(type="noul", instructions="Is the customer asking for a refund?")),
+        render_score(state, ScoreQuestion(type="score", instructions="How frustrated is the customer?",
+                                          criteria=["calm", "annoyed", "furious"])),
+    ]
+    prefix = scorer.prefill_prefix(state_prefix(state))
+    if prefix is None:
+        print("shared prefix: skipped (state too short)")
+        return 0.0
+
+    worst = 0.0
+    for prompt, labels in questions:
+        whole = [r.logprob_sum for r in scorer.score(prompt, labels, norm="sum")]
+        shared = [r.logprob_sum for r in scorer.score_with_prefix(prefix, prompt, labels, norm="sum")]
+        diffs = [abs(a - b) for a, b in zip(whole, shared)]
+        worst = max(worst, max(diffs))
+        print(f"shared prefix: prefix_tokens={len(prefix.ids):4d} suffix_tokens="
+              f"{scorer.last_timing['suffix_tokens']:4d} labels={len(labels)} max_abs_diff={max(diffs):.6f}")
+    return worst
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
