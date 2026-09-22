@@ -163,6 +163,35 @@ print(s.last_timing)
 | `sum` | total log-prob | options are the same length or you want raw likelihood |
 | `pmi` | sum minus the option's unconditional log-prob (BOS-only context) | options differ in base-rate plausibility; costs one extra batched pass |
 
+## Choosing a model
+
+The scorer is model-agnostic and builds whatever cache layout the model declares, so
+swapping backbones is a path change. `make setup-gemma4` fetches Gemma 4 26B A4B, whose
+3.8B active parameters keep prefill near a 4B dense model while answers track the dense 31B.
+
+On the docs' quick-start request, against the numbers TypeSafe publishes for Jev:
+
+| answer | Jev (docs) | Gemma 3 4B | Gemma 4 26B A4B |
+| --- | --- | --- | --- |
+| `department.choice` | technical, p=0.84 | technical, p=1.00 | technical, p=1.00 |
+| `frustration.score` | 1.04 | 2.00 | 2.00 |
+| `is_urgent.noul` | 0.999 | 0.005 | **0.998** |
+
+Gemma 4 resolves the urgency disagreement and leaves the other two unchanged. Note what
+does *not* move: both models answer at p=1.00 where Jev says 0.84. A stronger backbone
+fixes which answer you get, not how confident it claims to be. Post-hoc calibration on
+labelled rows is a separate problem, and monotone methods cannot flip an answer anyway.
+
+Cost on a 12,514-token state, one shared prefill then typed questions against it:
+
+| model | prefill | per question | 600 questions |
+| --- | --- | --- | --- |
+| Gemma 3 4B | 8.2 s | 113 ms | 1.3 min |
+| Gemma 4 26B A4B 4-bit | 11.3 s | 214 ms | 2.3 min |
+
+Measured on an M5 Pro, 48 GB. The MoE's long batched prefill touches every expert, so it
+is slower than its active-parameter count suggests, but it stays within 2x of the 4B dense.
+
 ## Measured on M5 Pro, 64 GB (bf16, mlx-lm)
 
 Workload: 202-token context, 8 options, 242 option tokens total.
