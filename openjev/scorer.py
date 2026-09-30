@@ -29,6 +29,13 @@ NORMS = ("mean", "sum", "pmi")
 # buffer ceiling; chunking bounds the query side of that matrix instead.
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
+# MLX's allocator keeps freed buffers for reuse, and by default it may keep
+# almost all of system RAM. Every request has a different prompt length, so
+# few of those buffers are ever reused and the process keeps growing: a
+# long-running server reached 35 GB with under 10 GB actually in use. This
+# caps only the retained free buffers, not the memory a forward pass needs.
+DEFAULT_CACHE_LIMIT_MIB = 256
+
 
 @dataclass(frozen=True)
 class PrefixCache:
@@ -74,6 +81,8 @@ class OptionScorer:
             prompt appended) so options are scored as the start of the reply.
         sep: literal string placed between context and each option (ignored
             when ``chat`` is set, since the template already ends the turn).
+        cache_limit_mib: cap on MLX's cache of freed buffers (see
+            ``DEFAULT_CACHE_LIMIT_MIB``); 0 disables the cache.
     """
 
     def __init__(
@@ -83,7 +92,10 @@ class OptionScorer:
         chat: bool = False,
         sep: str = "",
         prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
+        cache_limit_mib: int = DEFAULT_CACHE_LIMIT_MIB,
     ) -> None:
+        # Process-wide setting; applies to every model loaded in this process.
+        mx.set_cache_limit(cache_limit_mib * 1024 * 1024)
         self.model, self.tok = load(model_path)
         self.batch_size = max(1, batch_size)
         self.chat = chat
