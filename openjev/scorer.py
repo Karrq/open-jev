@@ -36,6 +36,16 @@ DEFAULT_PREFILL_STEP_SIZE = 2048
 # caps only the retained free buffers, not the memory a forward pass needs.
 DEFAULT_CACHE_LIMIT_MIB = 256
 
+# Extra tokens a sliding-window layer keeps past its window after prefill. A later
+# request that shares the prefix only up to a few tokens before its end (the state
+# grew, so its last tokens merge differently) can then trim the cache back by up to
+# this many tokens and still hold a full window. See prefix_store.trim.
+WINDOW_SLACK = 64
+
+# Upper bound on batch x length of one packed question pass (see packed.py). The
+# attention score matrix of that pass is (heads x this x context), so it bounds memory.
+DEFAULT_PACKED_TOKENS = 2048
+
 
 @dataclass(frozen=True)
 class PrefixCache:
@@ -131,7 +141,7 @@ class OptionScorer:
         return ids
 
     # --------------------------------------------------------------- prefill
-    def _prefill(self, ids: list[int]) -> tuple[list[KVCache], mx.array]:
+    def _prefill(self, ids: list[int], cache: list | None = None) -> tuple[list[KVCache], mx.array]:
         """Prefill with the model's own cache layout, in bounded-size steps.
 
         Gemma 3 interleaves 29 sliding-window layers with 5 global ones. Giving
@@ -145,6 +155,9 @@ class OptionScorer:
         ``DEFAULT_PREFILL_STEP_SIZE``) and is a side effect of chunking, not
         its purpose.
 
+        Pass ``cache`` to continue from an already prefilled prefix; it is extended
+        in place.
+
         Compacting after every chunk, not just once at the end, matters at
         long context: ``mx.concatenate`` is not in-place, so each update
         allocates a fresh old-plus-new buffer for every layer. Left untrimmed
@@ -153,7 +166,7 @@ class OptionScorer:
         holds both the old and new copies live -- close to double the final
         size by the last chunk of a long prompt.
         """
-        cache = make_prompt_cache(self.model)
+        cache = make_prompt_cache(self.model) if cache is None else cache
         last = None
         for start in range(0, len(ids), self.prefill_step_size):
             chunk = ids[start : start + self.prefill_step_size]
@@ -170,15 +183,17 @@ class OptionScorer:
         A bulk prefill stores every token, because RotatingKVCache only trims on
         its next update. Trimming to the window now makes the retained prefix
         several times smaller without changing any later result: the next update
-        would have trimmed to exactly this same tail anyway.
+        would have trimmed to this same tail anyway. ``WINDOW_SLACK`` extra tokens
+        are kept so a shared prefix can be trimmed back slightly (attention masks
+        already hide anything past the window).
         """
         for c in cache:
             if not isinstance(c, RotatingKVCache) or c.keys is None:
                 continue
-            if c.keys.shape[2] <= c.max_size:
+            if c.keys.shape[2] <= c.max_size + WINDOW_SLACK:
                 continue
             keys, values = c._temporal_order(c.keys), c._temporal_order(c.values)
-            tail = c.max_size - c.keep
+            tail = c.max_size + WINDOW_SLACK - c.keep
             if c.keep:
                 keys = mx.concatenate([keys[..., : c.keep, :], keys[..., -tail:, :]], axis=2)
                 values = mx.concatenate([values[..., : c.keep, :], values[..., -tail:, :]], axis=2)
@@ -374,6 +389,47 @@ class OptionScorer:
             "option_tokens": sum(len(o) for o in opts),
         }
         return self._finalize(options, opts, sums, None, norm)
+
+    def last_logits(
+        self, cache: list, suffixes: list[list[int]], packed_tokens: int = DEFAULT_PACKED_TOKENS
+    ) -> list[mx.array]:
+        """Next-token logits after each ``prefix + suffix``, one float32 vector per suffix.
+
+        ``cache`` holds the prefilled prefix and is not modified. Suffixes are packed
+        into shared forward passes of at most ``packed_tokens`` (batch x length) when
+        the model's cache layout allows it (see packed.py); otherwise each suffix runs
+        on its own copy of the prefix.
+        """
+        from . import packed
+
+        heads = packed.text_model(self.model) if packed.supported(cache) else None
+        out: list[mx.array | None] = [None] * len(suffixes)
+        if heads is None:
+            for i, s in enumerate(suffixes):
+                out[i] = self.model(mx.array(s)[None], cache=self._clone(cache))[0, -1].astype(mx.float32)
+                mx.eval(out[i])
+            return out
+        packed.install(self.model)
+        inner, head = heads
+        # Similar lengths share a pass, so little of it is padding.
+        order = sorted(range(len(suffixes)), key=lambda i: len(suffixes[i]))
+        groups, cur = [], []
+        for i in order:
+            if cur and (len(cur) + 1) * len(suffixes[i]) > packed_tokens:
+                groups.append(cur)
+                cur = []
+            cur.append(i)
+        groups.append(cur)
+        for g in groups:
+            L = max(len(suffixes[i]) for i in g)
+            arr = mx.array([suffixes[i] + [self.pad_id] * (L - len(suffixes[i])) for i in g])
+            h = inner(arr, cache=[packed.PackedCache(c, len(g)) for c in cache])
+            h = h[mx.arange(len(g)), mx.array([len(suffixes[i]) - 1 for i in g])]
+            logits = head(h).astype(mx.float32)
+            mx.eval(logits)
+            for row, i in enumerate(g):
+                out[i] = logits[row]
+        return out
 
     def score_naive(self, context: str, options: Sequence[str]) -> list[float]:
         """Reference: re-encode context + option from scratch per option, no cache.

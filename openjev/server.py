@@ -7,12 +7,14 @@
 from __future__ import annotations
 
 import os
+import threading
 import time
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from .prefix_store import DEFAULT_MAX_BYTES, DEFAULT_MIN_TOKENS, DEFAULT_TTL_S, PrefixStore
 from .scorer import DEFAULT_MODEL, OptionScorer
 from .systemone import SystemOneRequest, SystemOneResponse, system_one
 
@@ -48,6 +50,17 @@ def create_app(model_path: str | None = None, batch_size: int = 8) -> FastAPI:
     state: dict = {}
     api_key = os.environ.get("OPENJEV_API_KEY")  # if set, /v1/systemone requires "Authorization: Bearer <key>"
     model_name = os.path.basename(model_path.rstrip("/"))
+    readout = os.environ.get("OPENJEV_READOUT", "letters")
+    # Prefilled states kept across /v1/systemone requests; OPENJEV_PREFIX_CACHE_GB=0 disables.
+    store_bytes = int(float(os.environ.get("OPENJEV_PREFIX_CACHE_GB", DEFAULT_MAX_BYTES / 2**30)) * 2**30)
+    store = PrefixStore(
+        max_bytes=store_bytes,
+        ttl_s=float(os.environ.get("OPENJEV_PREFIX_TTL_S", DEFAULT_TTL_S)),
+        min_tokens=int(os.environ.get("OPENJEV_PREFIX_MIN_TOKENS", DEFAULT_MIN_TOKENS)),
+    ) if store_bytes > 0 else None
+    # MLX is not thread-safe and FastAPI runs sync handlers on a thread pool, so
+    # requests take turns on the model.
+    lock = threading.Lock()
 
     def _auth(authorization: str | None = Header(default=None)) -> None:
         if api_key and authorization != f"Bearer {api_key}":
@@ -63,7 +76,12 @@ def create_app(model_path: str | None = None, batch_size: int = 8) -> FastAPI:
 
     @app.get("/health")
     def health() -> dict:
-        return {"ok": "scorer" in state, "model": model_path, "load_s": state.get("load_s")}
+        return {
+            "ok": "scorer" in state,
+            "model": model_path,
+            "load_s": state.get("load_s"),
+            "prefix_cache": store.info() if store is not None else None,
+        }
 
     @app.post("/score", response_model=ScoreResponse)
     def score(req: ScoreRequest) -> ScoreResponse:
@@ -71,7 +89,9 @@ def create_app(model_path: str | None = None, batch_size: int = 8) -> FastAPI:
         if scorer is None:
             raise HTTPException(503, "model still loading")
         try:
-            res = scorer.score(req.context, req.options, norm=req.norm, chat=req.chat, sep=req.sep)
+            with lock:
+                res = scorer.score(req.context, req.options, norm=req.norm, chat=req.chat, sep=req.sep)
+                timing = dict(scorer.last_timing)
         except ValueError as e:
             raise HTTPException(400, str(e))
         best = max(range(len(res)), key=lambda i: res[i].score)
@@ -79,7 +99,7 @@ def create_app(model_path: str | None = None, batch_size: int = 8) -> FastAPI:
             best=res[best].option,
             best_index=best,
             options=[OptionOut(**r.to_dict()) for r in res],
-            timing=scorer.last_timing,
+            timing=timing,
         )
 
     @app.post("/v1/systemone", response_model=SystemOneResponse, dependencies=[Depends(_auth)])
@@ -89,7 +109,8 @@ def create_app(model_path: str | None = None, batch_size: int = 8) -> FastAPI:
         if scorer is None:
             raise HTTPException(503, "model still loading")
         try:
-            return system_one(scorer, req, model_name=req.model or model_name)
+            with lock:
+                return system_one(scorer, req, model_name=req.model or model_name, readout=readout, store=store)
         except ValueError as e:
             raise HTTPException(400, str(e))
 
