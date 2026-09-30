@@ -9,7 +9,7 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
     "huggingface-hub>=1.31.0",
-    "mlx>=0.24; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "mlx>=0.32.3; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "mlx-lm>=0.24; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "torch>=2.6; sys_platform != 'darwin' or platform_machine != 'arm64'",
     "numpy>=2.5.3",
