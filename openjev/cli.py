@@ -294,7 +294,7 @@ def main(argv: list[str] | None = None) -> None:
     eh.set_defaults(fn=cmd_eval_head)
 
     v = sub.add_parser("serve", help="HTTP server with the model loaded once (POST /score, /v1/systemone)")
-    v.add_argument("--model", default=DEFAULT_MODEL)
+    v.add_argument("--model", default=None, help="local dir or HF repo id (default: $OPENJEV_MODEL)")
     v.add_argument("--batch-size", type=int, default=8)
     v.add_argument("--backend", choices=("auto", "mlx", "torch"), default="auto")
     v.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:N, or mps")

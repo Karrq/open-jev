@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import gc
 import os
 import threading
 import time
@@ -61,7 +62,55 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
     ) if store_bytes > 0 else None
     # MLX is not thread-safe and FastAPI runs sync handlers on a thread pool, so
     # requests take turns on the model.
-    lock = threading.Lock()
+    # Reentrant so a handler that already holds it can load the model on demand.
+    lock = threading.RLock()
+    # 0 keeps the weights loaded forever; otherwise they are freed after this many
+    # idle seconds and loaded again on the next request.
+    idle_unload_s = float(os.environ.get("OPENJEV_IDLE_UNLOAD_S", "0"))
+    activity = {"at": time.monotonic(), "unloads": 0}
+
+    def _load_scorer() -> OptionScorer:
+        t = time.perf_counter()
+        scorer = OptionScorer(model_path, batch_size=batch_size, adapter_path=adapter_path, backend=backend, device=device)
+        scorer.score("warm up", ["a", "b"])  # compile kernels before the first request
+        state["scorer"] = scorer
+        state["load_s"] = time.perf_counter() - t
+        state["loaded_at"] = time.monotonic()
+        return scorer
+
+    def _unload_scorer() -> None:
+        state["scorer"] = None
+        if store is not None:
+            store.entries.clear()  # caches belong to the weights just freed
+        gc.collect()
+        try:
+            import mlx.core as mx  # MLX-only; the torch backend has no MLX cache to clear
+        except ImportError:
+            pass
+        else:
+            mx.clear_cache()
+        activity["unloads"] += 1
+
+    def _scorer() -> OptionScorer:
+        """The loaded scorer, loading it under the lock if an idle period unloaded it."""
+        scorer = state.get("scorer")
+        if scorer is None:
+            with lock:
+                scorer = state.get("scorer") or _load_scorer()
+        activity["at"] = time.monotonic()
+        return scorer
+
+    def _idle_watch() -> None:
+        while True:
+            time.sleep(min(30.0, max(1.0, idle_unload_s / 4)))
+            if idle_unload_s <= 0 or state.get("scorer") is None:
+                continue
+            with lock:
+                if time.monotonic() - activity["at"] >= idle_unload_s:
+                    _unload_scorer()
+
+    if idle_unload_s > 0:
+        threading.Thread(target=_idle_watch, daemon=True).start()
 
     def _auth(authorization: str | None = Header(default=None)) -> None:
         if api_key and authorization != f"Bearer {api_key}":
@@ -69,18 +118,17 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
 
     @app.on_event("startup")
     def _load() -> None:
-        t = time.perf_counter()
-        scorer = OptionScorer(model_path, batch_size=batch_size, adapter_path=adapter_path, backend=backend, device=device)
-        scorer.score("warm up", ["a", "b"])  # compile kernels before the first request
-        state["scorer"] = scorer
-        state["load_s"] = time.perf_counter() - t
+        _load_scorer()
 
     @app.get("/health")
     def health() -> dict:
         return {
-            "ok": "scorer" in state,
+            "ok": state.get("scorer") is not None,
+            "loaded": state.get("scorer") is not None,
             "model": model_path,
-            "load_s": state.get("load_s"),
+            "load_s": round(state.get("load_s", 0), 2),
+            "idle_for_s": round(time.monotonic() - activity["at"], 1),
+            "unloads": activity["unloads"],
             "backend": getattr(state.get("scorer"), "backend", None),
             "device": getattr(state.get("scorer"), "device", None),
             "prefix_cache": store.info() if store is not None else None,
@@ -88,11 +136,9 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
 
     @app.post("/score", response_model=ScoreResponse)
     def score(req: ScoreRequest) -> ScoreResponse:
-        scorer: OptionScorer = state.get("scorer")
-        if scorer is None:
-            raise HTTPException(503, "model still loading")
         try:
             with lock:
+                scorer = _scorer()
                 res = scorer.score(req.context, req.options, norm=req.norm, chat=req.chat, sep=req.sep)
                 timing = dict(scorer.last_timing)
         except ValueError as e:
@@ -108,12 +154,9 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
     @app.post("/v1/systemone", response_model=SystemOneResponse, dependencies=[Depends(_auth)])
     def systemone(req: SystemOneRequest) -> SystemOneResponse:
         """TypeSafe System One contract: state + typed questions -> typed answers (docs.typesafe.ai)."""
-        scorer: OptionScorer = state.get("scorer")
-        if scorer is None:
-            raise HTTPException(503, "model still loading")
         try:
             with lock:
-                return system_one(scorer, req, model_name=req.model or model_name, readout=readout, store=store)
+                return system_one(_scorer(), req, model_name=req.model or model_name, readout=readout, store=store)
         except ValueError as e:
             raise HTTPException(400, str(e))
 
