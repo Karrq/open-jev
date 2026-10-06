@@ -15,9 +15,23 @@ from typing import Literal
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
+from . import packed
 from .prefix_store import DEFAULT_MAX_BYTES, DEFAULT_MIN_TOKENS, DEFAULT_TTL_S, PrefixStore
 from .scorer import DEFAULT_MODEL, OptionScorer
 from .systemone import SystemOneRequest, SystemOneResponse, system_one
+
+
+def _mlx():
+    """The ``mlx.core`` module on the MLX backend, else ``None``.
+
+    Imported lazily so the package and the torch backend load on machines
+    without MLX.
+    """
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return None
+    return mx
 
 
 class ScoreRequest(BaseModel):
@@ -69,6 +83,33 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
     idle_unload_s = float(os.environ.get("OPENJEV_IDLE_UNLOAD_S", "0"))
     activity = {"at": time.monotonic(), "unloads": 0}
 
+    # MLX's peak counter is cumulative unless reset, so each request resets it
+    # and records its own peak; state["peak_mb"] keeps the high-water mark across
+    # requests. Reset at request start, read at request end, under the model lock.
+    def _mem() -> dict:
+        mx = _mlx()
+        if mx is None:
+            return {}
+        return {
+            "active_mb": round(mx.get_active_memory() / 2**20, 1),
+            "cache_mb": round(mx.get_cache_memory() / 2**20, 1),
+        }
+
+    def _measure_start() -> None:
+        mx = _mlx()
+        if mx is not None:
+            mx.reset_peak_memory()
+
+    def _measure_end(kind: str) -> dict:
+        mx = _mlx()
+        if mx is None:
+            return {}
+        peak = round(mx.get_peak_memory() / 2**20, 1)
+        state["peak_mb"] = max(state.get("peak_mb", 0.0), peak)
+        info = {**_mem(), "request_peak_mb": peak, "peak_mb": round(state["peak_mb"], 1)}
+        state["last_request"] = {"kind": kind, **info}
+        return info
+
     def _load_scorer() -> OptionScorer:
         t = time.perf_counter()
         scorer = OptionScorer(model_path, batch_size=batch_size, adapter_path=adapter_path, backend=backend, device=device)
@@ -83,11 +124,8 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
         if store is not None:
             store.entries.clear()  # caches belong to the weights just freed
         gc.collect()
-        try:
-            import mlx.core as mx  # MLX-only; the torch backend has no MLX cache to clear
-        except ImportError:
-            pass
-        else:
+        mx = _mlx()
+        if mx is not None:
             mx.clear_cache()
         activity["unloads"] += 1
 
@@ -131,6 +169,12 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
             "unloads": activity["unloads"],
             "backend": getattr(state.get("scorer"), "backend", None),
             "device": getattr(state.get("scorer"), "device", None),
+            "memory": {
+                **_mem(),
+                "peak_mb": round(state.get("peak_mb", 0.0), 1),
+                "last_request": state.get("last_request"),
+            },
+            "force_fused": packed._FORCE_FUSED,
             "prefix_cache": store.info() if store is not None else None,
         }
 
@@ -139,8 +183,10 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
         try:
             with lock:
                 scorer = _scorer()
+                _measure_start()
                 res = scorer.score(req.context, req.options, norm=req.norm, chat=req.chat, sep=req.sep)
                 timing = dict(scorer.last_timing)
+                timing.update(_measure_end("score"))
         except ValueError as e:
             raise HTTPException(400, str(e))
         best = max(range(len(res)), key=lambda i: res[i].score)
@@ -156,7 +202,10 @@ def create_app(model_path: str | None = None, batch_size: int = 8, backend: str 
         """TypeSafe System One contract: state + typed questions -> typed answers (docs.typesafe.ai)."""
         try:
             with lock:
-                return system_one(_scorer(), req, model_name=req.model or model_name, readout=readout, store=store)
+                _measure_start()
+                resp = system_one(_scorer(), req, model_name=req.model or model_name, readout=readout, store=store)
+                _measure_end("systemone")
+                return resp
         except ValueError as e:
             raise HTTPException(400, str(e))
 

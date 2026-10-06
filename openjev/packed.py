@@ -16,6 +16,7 @@ with recurrent layers (Qwen3.5's ``ArraysCache``) are rejected by ``supported``.
 """
 from __future__ import annotations
 
+import os
 import sys
 from typing import Optional
 
@@ -77,14 +78,42 @@ class PackedCache:
         return mx.concatenate([pre.reshape(B * N, P), suf.reshape(B * N, B * N)], axis=1)
 
 
+_FORCE_FUSED = os.environ.get("OPENJEV_FORCE_FUSED", "1").lower() not in ("0", "false", "no", "off")
+
+
+def _fused_sdpa(queries, keys, values, scale, mask, sinks=None):
+    """``mx.fast.scaled_dot_product_attention`` with the fused kernel forced.
+
+    MLX's default heuristic does not pick the fused kernel for Gemma 4's global
+    ``head_dim=512`` with a packed boolean mask, so it materializes the full
+    (queries x keys) score matrix: at 2048 queries x 30k keys that is ~3 GB in a
+    single call, against ~0.2 GB for the fused kernel. The fused kernel is not
+    available for every shape and can be slower, so this falls back to the
+    default on the first failure and stays off for the rest of the process.
+    """
+    global _FORCE_FUSED
+    if _FORCE_FUSED:
+        try:
+            return mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=scale, mask=mask, sinks=sinks, force_fused=True
+            )
+        except Exception:
+            _FORCE_FUSED = False
+    return mx.fast.scaled_dot_product_attention(
+        queries, keys, values, scale=scale, mask=mask, sinks=sinks
+    )
+
+
 def _packed_sdpa(original):
     def sdpa(queries, keys, values, cache, scale, mask, sinks=None, **kw):
-        if not isinstance(cache, PackedCache):
+        if isinstance(cache, PackedCache):
+            B, H, L, D = queries.shape
+            q = queries.transpose(1, 0, 2, 3).reshape(1, H, B * L, D)
+            out = _fused_sdpa(q, keys, values, scale, mask, sinks)
+            return out.reshape(H, B, L, -1).transpose(1, 0, 2, 3)
+        if hasattr(cache, "bits"):
             return original(queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks, **kw)
-        B, H, L, D = queries.shape
-        q = queries.transpose(1, 0, 2, 3).reshape(1, H, B * L, D)
-        out = mx.fast.scaled_dot_product_attention(q, keys, values, scale=scale, mask=mask, sinks=sinks)
-        return out.reshape(H, B, L, -1).transpose(1, 0, 2, 3)
+        return _fused_sdpa(queries, keys, values, scale, mask, sinks)
 
     sdpa.__openjev_packed__ = True
     return sdpa
