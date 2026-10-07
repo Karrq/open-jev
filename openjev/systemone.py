@@ -136,6 +136,20 @@ def state_prefix(state: Entry) -> str:
     return _block("State", state)
 
 
+def state_cache_key(state: Entry) -> str:
+    """Canonical cache identity of a state, prefix-comparable across requests.
+
+    Equal states give equal keys, and a state that extends another gives a key that
+    extends the other's, so the prefix store can match a growing state to the cached
+    ancestor it already holds. Raw strings are used as-is, since JSON would wrap them
+    in quotes and break that extension; structured states use canonical JSON, where a
+    grown field still shares a long prefix.
+    """
+    if isinstance(state, str):
+        return state
+    return json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
 def render_choice(state: Entry, q: ChoiceQuestion) -> tuple[str, list[str]]:
     lines = []
     for name, desc in q.criteria.items():
@@ -258,6 +272,7 @@ def system_one(
     norm: str = "sum",
     readout: str = "letters",
     store: PrefixStore | None = None,
+    cache_key: str | None = None,
 ) -> SystemOneResponse:
     if readout not in READOUTS:
         raise ValueError(f"readout must be one of {READOUTS}")
@@ -267,7 +282,7 @@ def system_one(
     if readout == "letters":
         lettered = {qid: q for qid, q in questions.items() if len(option_descriptions(q)[0]) <= len(LETTERS)}
         if lettered:
-            answers, in_tok, out_tok = _letters(scorer, req.state, lettered, store)
+            answers, in_tok, out_tok = _letters(scorer, req.state, lettered, store, cache_key)
         questions = {qid: q for qid, q in questions.items() if qid not in lettered}
     if questions:
         more, i, o = _continuation(scorer, req.state, questions, norm)
@@ -277,7 +292,13 @@ def system_one(
     return SystemOneResponse(model=model_name, answers=answers, usage=Usage(input_tokens=in_tok, output_tokens=out_tok))
 
 
-def _letters(scorer: OptionScorer, state: Entry, questions: dict[str, Question], store: PrefixStore | None):
+def _letters(
+    scorer: OptionScorer,
+    state: Entry,
+    questions: dict[str, Question],
+    store: PrefixStore | None,
+    cache_key: str | None = None,
+):
     """All questions share one prefilled prefix and are read in packed passes."""
     t0 = time.perf_counter()
     slots = []
@@ -297,7 +318,7 @@ def _letters(scorer: OptionScorer, state: Entry, questions: dict[str, Question],
     *encoded, probe = letter_ids(scorer, conversations)
     rows = [(*r, ids) for r, ids in zip(rows, encoded)]
     n = min(prefix_store.common_len(probe, ids) for *_, ids in rows)
-    cache, info = prefix_store.prefill(scorer, store, probe[:n])
+    cache, info = prefix_store.prefill(scorer, store, probe[:n], key=cache_key)
     t1 = time.perf_counter()
     logits = scorer.last_logits(cache, [ids[n:] for *_, ids in rows])
     answers = {}
