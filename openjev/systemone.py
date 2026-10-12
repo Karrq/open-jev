@@ -34,7 +34,11 @@ import math
 import time
 from typing import Any, Literal, Union
 
-import mlx.core as mx
+try:
+    import mlx.core as mx
+except ImportError:  # MLX is Apple-silicon only; only the packed readout needs it
+    mx = None
+
 from pydantic import BaseModel, Field, model_validator
 
 from . import prefix_store

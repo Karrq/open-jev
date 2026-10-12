@@ -32,8 +32,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-import mlx.core as mx
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+try:
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+except ImportError:  # MLX is Apple-silicon only; the prefix store needs it at runtime
+    KVCache = None
+    RotatingKVCache = None
 
 from .scorer import WINDOW_SLACK
 

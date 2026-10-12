@@ -20,8 +20,13 @@ import logging
 import sys
 from typing import Optional
 
-import mlx.core as mx
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+try:
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache, RotatingKVCache
+except ImportError:  # MLX is Apple-silicon only; the packed path requires it
+    mx = None
+    KVCache = None
+    RotatingKVCache = None
 
 
 class PackedCache:
